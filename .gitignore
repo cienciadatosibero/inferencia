@@ -1,5 +1,4 @@
-@"
-.venv/
+﻿.venv/
 __pycache__/
 *.pyc
 *.pyo
@@ -11,4 +10,4 @@ __pycache__/
 .idea/
 .DS_Store
 runs/
-"@ | Out-File -Encoding utf8 .gitignore
+*.zip
