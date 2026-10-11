@@ -13,7 +13,11 @@ Ejecuta:  uvicorn app:app --host 0.0.0.0 --port 8000
 import base64
 import io
 import os
-from typing import Optional
+from pathlib import Path
+from threading import RLock
+
+from fastapi import Header
+from pydantic import Field
 
 import numpy as np
 from fastapi import FastAPI, HTTPException
@@ -35,16 +39,31 @@ _estado = {
     "names": {},
 }
 _cache: dict = {}  # ruta -> YOLO
+_lock = RLock()
+_ROOT = Path(__file__).resolve().parent
+_DEFAULT_WEIGHTS = os.getenv("MODEL_WEIGHTS_PATH", "modelos/best.pt")
+_MODEL_IMGSZ = max(640, min(1280, int(os.getenv("YOLO_IMGSZ", "960"))))
+_TOKEN = os.getenv("INFERENCE_API_TOKEN", "").strip()
+
+def _check_token(authorization):
+    if _TOKEN and authorization != f"Bearer {_TOKEN}":
+        raise HTTPException(status_code=401, detail="No autorizado")
+
 
 
 def _cargar_yolo(path: str):
     if YOLO is None:
         raise RuntimeError(f"ultralytics no está disponible: {_IMPORT_ERROR}")
-    if not os.path.exists(path):
-        raise FileNotFoundError(f"No existe el peso: {path}")
-    if path not in _cache:
-        _cache[path] = YOLO(path)
-    return _cache[path]
+    ruta = Path(path).expanduser()
+    if not ruta.is_absolute():
+        ruta = _ROOT / ruta
+    ruta = str(ruta.resolve())
+    if not os.path.isfile(ruta):
+        raise FileNotFoundError(f"No existe el peso: {Path(ruta).name}")
+    with _lock:
+        if ruta not in _cache:
+            _cache[ruta] = YOLO(ruta)
+        return _cache[ruta]
 
 
 # ----------------------- Modelos de petición -----------------------
@@ -54,7 +73,7 @@ class LoadReq(BaseModel):
 
 class PredictReq(BaseModel):
     image_base64: str
-    conf: float = 0.25
+    conf: float = Field(default=0.20, ge=0.05, le=0.95)
     return_crops: bool = True
 
 
@@ -62,8 +81,17 @@ class PredictReq(BaseModel):
 def _b64_a_imagen(b64: str) -> Image.Image:
     if "," in b64:
         b64 = b64.split(",", 1)[1]
-    raw = base64.b64decode(b64)
-    return Image.open(io.BytesIO(raw)).convert("RGB")
+    try:
+        raw = base64.b64decode(b64, validate=True)
+        if len(raw) > 15 * 1024 * 1024:
+            raise ValueError("Imagen demasiado grande (máximo 15 MB)")
+        imagen = Image.open(io.BytesIO(raw))
+        imagen.load()
+        if imagen.width * imagen.height > 16_000_000:
+            raise ValueError("Imagen supera el límite de 16 megapíxeles")
+        return imagen.convert("RGB")
+    except (ValueError, OSError) as e:
+        raise HTTPException(status_code=400, detail=f"Imagen inválida: {e}") from e
 
 
 def _recorte_b64(img: Image.Image, x, y, w, h) -> str:
@@ -89,8 +117,9 @@ def health():
 
 
 @app.post("/load")
-def load(req: LoadReq):
+def load(req: LoadReq, authorization: str | None = Header(default=None)):
     """Carga un peso y devuelve sus clases (para registrarlo en la BD)."""
+    _check_token(authorization)
     try:
         modelo = _cargar_yolo(req.weights_path)
         names = modelo.names if hasattr(modelo, "names") else {}
@@ -100,12 +129,13 @@ def load(req: LoadReq):
 
 
 @app.post("/activate")
-def activate(req: LoadReq):
+def activate(req: LoadReq, authorization: str | None = Header(default=None)):
     """Deja un peso como modelo activo en memoria."""
+    _check_token(authorization)
     try:
         modelo = _cargar_yolo(req.weights_path)
         _estado["model"] = modelo
-        _estado["active_path"] = req.weights_path
+        _estado["active_path"] = str(Path(req.weights_path).resolve())
         _estado["names"] = modelo.names if hasattr(modelo, "names") else {}
         return {"ok": True, "classes": _estado["names"]}
     except Exception as e:
@@ -113,18 +143,24 @@ def activate(req: LoadReq):
 
 
 @app.post("/predict")
-def predict(req: PredictReq):
+def predict(req: PredictReq, authorization: str | None = Header(default=None)):
     """Detecta sobre la imagen y devuelve cajas en píxeles + recortes."""
+    _check_token(authorization)
     if _estado["model"] is None:
-        raise HTTPException(
-            status_code=409,
-            detail="No hay modelo activo. El administrador debe activar un peso primero.",
-        )
+        try:
+            modelo = _cargar_yolo(_DEFAULT_WEIGHTS)
+            with _lock:
+                if _estado["model"] is None:
+                    _estado.update(model=modelo, active_path=str(_DEFAULT_WEIGHTS), names=modelo.names)
+        except Exception as e:
+            raise HTTPException(status_code=409, detail=f"No hay modelo disponible: {e}")
     try:
         img = _b64_a_imagen(req.image_base64)
         arr = np.array(img)[:, :, ::-1]  # RGB -> BGR para YOLO
 
-        resultados = _estado["model"].predict(source=arr, conf=req.conf, verbose=False)
+        with _lock:
+            resultados = _estado["model"].predict(source=arr, conf=req.conf,
+                                                    imgsz=_MODEL_IMGSZ, iou=0.45, verbose=False)
         r = resultados[0]
         names = _estado["names"]
 
@@ -134,6 +170,10 @@ def predict(req: PredictReq):
                 x1, y1, x2, y2 = [float(v) for v in b.xyxy[0].tolist()]
                 cls_id = int(b.cls[0].item())
                 conf = float(b.conf[0].item())
+                x1, y1 = max(0, x1), max(0, y1)
+                x2, y2 = min(img.width, x2), min(img.height, y2)
+                if x2 <= x1 or y2 <= y1:
+                    continue
                 w = x2 - x1
                 h = y2 - y1
                 det = {
